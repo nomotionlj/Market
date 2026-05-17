@@ -94,9 +94,69 @@ def _build_liqmap(coin: str, trades_per_coin: int):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _liqmap_png(coin: str, trades_per_coin: int) -> bytes:
-    """Build the figure and render to PNG bytes for the vision call. Cached."""
-    res = hlm.build_liqmap(coin=coin, trades_per_coin=trades_per_coin)
-    return hlm.figure_to_png_bytes(res["figure"], width=1400, height=600, scale=2)
+    """Build the figure and render to PNG bytes for the vision call. Cached.
+
+    Returns empty bytes if Kaleido / Chrome isn't available (e.g. on Streamlit
+    Cloud where we can't install Chrome). The text-fallback path takes over.
+    """
+    try:
+        res = hlm.build_liqmap(coin=coin, trades_per_coin=trades_per_coin)
+        return hlm.figure_to_png_bytes(res["figure"], width=1400, height=600, scale=2)
+    except Exception:
+        return b""
+
+
+def _liqmap_text_context(cumdf, agg_df, current_price: float,
+                           coin: str, n_users: int, n_positions: int,
+                           top_n_bands: int = 12) -> str:
+    """Text fallback: a compact textual description of the HL liquidation map
+    that the AI can use in place of a chart image.
+    """
+    if cumdf is None or cumdf.empty:
+        return f"(HL liquidation map for {coin} unavailable)"
+
+    lines = [
+        f"LIVE HYPERLIQUID LIQUIDATION MAP — {coin} (EXACT, on-chain)",
+        f"Current price: ${current_price:,.2f}",
+        f"Coverage: {n_positions} positions from {n_users} traders scanned",
+        "",
+    ]
+
+    # Cumulative totals above + below
+    longs = cumdf[cumdf["cum_long_liq"] > 0]
+    shorts = cumdf[cumdf["cum_short_liq"] > 0]
+    total_long = float(longs["cum_long_liq"].max()) if not longs.empty else 0
+    total_short = float(shorts["cum_short_liq"].max()) if not shorts.empty else 0
+    lines.append(f"Total long-liq exposure below price: ${total_long/1e6:.1f}M "
+                  f"(forced SELLS if price drops)")
+    lines.append(f"Total short-liq exposure above price: ${total_short/1e6:.1f}M "
+                  f"(forced BUYS if price rises)")
+    lines.append("")
+
+    # Per-bucket spikes — biggest clusters by side
+    if agg_df is not None and not agg_df.empty:
+        below = agg_df[(agg_df["side"] == "long") &
+                          (agg_df["price"] <= current_price)] \
+                    .sort_values("liq_usd", ascending=False).head(top_n_bands)
+        above = agg_df[(agg_df["side"] == "short") &
+                          (agg_df["price"] >= current_price)] \
+                    .sort_values("liq_usd", ascending=False).head(top_n_bands)
+        if not above.empty:
+            lines.append(f"Top short-liquidation clusters ABOVE current price (price | $ at risk):")
+            for _, r in above.iterrows():
+                dist_pct = (r["price"] / current_price - 1) * 100
+                lines.append(f"  ${r['price']:,.0f}  (+{dist_pct:.1f}%)  →  "
+                             f"${r['liq_usd']/1e6:.2f}M forced buys")
+            lines.append("")
+        if not below.empty:
+            lines.append(f"Top long-liquidation clusters BELOW current price:")
+            for _, r in below.iterrows():
+                dist_pct = (r["price"] / current_price - 1) * 100
+                lines.append(f"  ${r['price']:,.0f}  ({dist_pct:+.1f}%)  →  "
+                             f"${r['liq_usd']/1e6:.2f}M forced sells")
+            lines.append("")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -173,17 +233,30 @@ def render(coin_default: str = "BTC") -> None:
         )
         st.caption(coverage_caption)
 
-        # Render the same chart to PNG bytes for the vision call
-        try:
-            png = _liqmap_png(coin, trades_per)
+        # Try PNG export → fall back to structured text if Kaleido / Chrome
+        # isn't available (e.g. on Streamlit Cloud).
+        png = _liqmap_png(coin, trades_per)
+        if png:
             auto_image = vp.ImageInput(
                 name=f"AUTO {coin} HL liquidation map ({n_users} addr, {n_positions} pos)",
                 source="HL_exact",
                 data=png,
                 media_type="image/png",
             )
-        except Exception as e:
-            st.warning(f"Could not render map to PNG for AI panel: {e}")
+            auto_text_context = ""
+        else:
+            auto_image = None
+            auto_text_context = _liqmap_text_context(
+                cumdf=cumdf, agg_df=aggdf,
+                current_price=current_price, coin=coin,
+                n_users=n_users, n_positions=n_positions,
+            )
+            st.caption(
+                "ℹ Sending HL map to the AI as **structured text** "
+                "(image renderer not available in this environment). "
+                "AI gets exact dollar amounts per price level — often more "
+                "accurate than chart vision."
+            )
 
     # ── Optional uploads ──
     with st.expander("➕ Add supplementary screenshots (optional)", expanded=False):
@@ -227,24 +300,40 @@ def render(coin_default: str = "BTC") -> None:
         images.append(auto_image)
     images.extend(upload_images if 'upload_images' in locals() else [])
 
+    # If the PNG fallback fired, fold the text-version of the HL map into the
+    # AI context so it still gets the on-chain data even with zero images.
+    if not auto_image and 'auto_text_context' in locals() and auto_text_context:
+        ctx_text = (ctx_text + "\n\n" + auto_text_context).strip()
+
     # ── Prompt + run ──
     with st.expander("Prompt template (editable)", expanded=False):
         prompt = st.text_area("System prompt sent to every model",
                                 value=vp.DEFAULT_PROMPT, height=320,
                                 key="confv2_prompt")
 
+    has_text_only = (not images) and 'auto_text_context' in locals() and auto_text_context
+    can_run = bool(images) or has_text_only
+
     rc1, rc2 = st.columns([1, 3])
     with rc1:
         run = st.button("🔬 Run confluence analysis",
                           type="primary",
-                          disabled=not images,
+                          disabled=not can_run,
                           key="confv2_run")
     with rc2:
-        st.caption(
-            f"Will send **{len(images)}** image(s) to {', '.join(models)}: "
-            f"{'1 auto HL map' if auto_image else 'no auto map'}"
-            + (f" + {len(images)-1} upload(s)" if (len(images)-1) > 0 else "")
-        )
+        if images:
+            st.caption(
+                f"Will send **{len(images)}** image(s) to {', '.join(models)}: "
+                f"{'1 auto HL map' if auto_image else 'no auto map'}"
+                + (f" + {len(images)-1} upload(s)" if (len(images)-1) > 0 else "")
+            )
+        elif has_text_only:
+            st.caption(
+                f"Will send the HL map as **structured text** to {', '.join(models)} "
+                f"(no images this run). Upload screenshots to add cross-source confluence."
+            )
+        else:
+            st.caption("Upload at least one image, or wait for the HL map to load.")
 
     if not run:
         return
