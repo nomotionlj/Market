@@ -1,0 +1,40 @@
+[
+  {
+    "file": "2026-05-04T22-41-49.json",
+    "timestamp": "2026-05-04T22:41:49.831545",
+    "preset": "Long-term Value",
+    "top_n": 10,
+    "n_returned": 10,
+    "tickers": [
+      "FOX",
+      "CTSH",
+      "FOXA",
+      "DIS",
+      "CMCSA",
+      "SOLV",
+      "UHS",
+      "FSLR",
+      "PYPL",
+      "DAL"
+    ]
+  },
+  {
+    "file": "2026-05-04T20-47-53.json",
+    "timestamp": "2026-05-04T20:47:53.429903",
+    "preset": "Magic Formula (Greenblatt)",
+    "top_n": 10,
+    "n_returned": 10,
+    "tickers": [
+      "ALL",
+      "CTSH",
+      "SOLV",
+      "PYPL",
+      "ACN",
+      "AOS",
+      "ADBE",
+      "FDS",
+      "LULU",
+      "NVR"
+    ]
+  }
+]
