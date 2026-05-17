@@ -71,8 +71,12 @@ def _frontend_open_orders(addr: str) -> List[Dict]:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _user_fills(addr: str, limit: int = 500) -> List[Dict]:
-    """Most recent N fills for `addr`. HL returns up to 2000 newest-first."""
+def _user_fills(addr: str, limit: int = 2000) -> List[Dict]:
+    """Most recent N fills for `addr`. HL caps this at 2000 newest-first.
+
+    For positions opened more than ~2000 fills ago, Age will be — that's
+    a hard API limit (HL doesn't expose older fills via this endpoint).
+    """
     res = _post({"type": "userFills", "user": addr})
     if not isinstance(res, list):
         return []
@@ -356,12 +360,7 @@ def _render_positions(positions: pd.DataFrame, marks: Dict[str, float],
         st.warning("No positions match the filters.")
         return
 
-    # Add distance-from-mark to liq_px
-    f = f.copy()
-    f["mark"] = f["coin"].str.upper().map(marks)
-    f["dist_to_liq_pct"] = (f["liq_px"] - f["mark"]).abs() / f["mark"] * 100
-
-    f = f.sort_values("notional", ascending=False)
+    f = f.sort_values("notional", ascending=False).copy()
 
     # Header aggregates
     total_long = f.loc[f["side"] == "long", "notional"].fillna(0).sum()
@@ -390,9 +389,6 @@ def _render_positions(positions: pd.DataFrame, marks: Dict[str, float],
         "Unrl PnL": f["unrealized_pnl"].apply(_fmt_usd),
         "Lev": f["leverage"].apply(lambda v: f"{int(v)}×" if pd.notna(v) else "—"),
         "Liq Px": f["liq_px"].apply(lambda v: f"${v:,.4g}" if pd.notna(v) else "—"),
-        "Mark": f["mark"].apply(lambda v: f"${v:,.4g}" if pd.notna(v) else "—"),
-        "Dist to Liq": f["dist_to_liq_pct"].apply(
-            lambda v: f"{v:.1f}%" if pd.notna(v) else "—"),
     })
     st.dataframe(show, hide_index=True, use_container_width=True,
                   height=min(45 + 32 * len(show), 620))
