@@ -65,6 +65,13 @@ def _clearinghouse(addr: str) -> Dict:
 
 
 @st.cache_data(ttl=120, show_spinner=False)
+def _clearinghouse_xyz(addr: str) -> Dict:
+    """Positions on the `xyz` sub-DEX — stock perps (TSLA, NVDA, AAPL, MSTR…),
+    commodity perps (GOLD, SILVER, BRENTOIL…), FX perps (EUR, JPY…)."""
+    return _post({"type": "clearinghouseState", "user": addr, "dex": "xyz"}) or {}
+
+
+@st.cache_data(ttl=120, show_spinner=False)
 def _frontend_open_orders(addr: str) -> List[Dict]:
     res = _post({"type": "frontendOpenOrders", "user": addr})
     return res if isinstance(res, list) else []
@@ -136,45 +143,55 @@ def _whale_dataset(addrs_tuple: tuple) -> Dict[str, pd.DataFrame]:
     pos_rows: List[Dict] = []
     ord_rows: List[Dict] = []
 
-    def _triple(addr: str) -> Tuple[Dict, List[Dict], List[Dict]]:
+    def _bundle(addr: str) -> Tuple[Dict, Dict, List[Dict], List[Dict]]:
+        # 4 calls per address in parallel: main perps + xyz stock perps + orders + fills.
+        # Each is independently cached so re-renders are cheap.
         return (_clearinghouse(addr),
+                _clearinghouse_xyz(addr),
                 _frontend_open_orders(addr),
                 _user_fills(addr))
 
     with ThreadPoolExecutor(max_workers=20) as ex:
-        results = list(ex.map(_triple, addrs))
+        results = list(ex.map(_bundle, addrs))
 
     import time
     now_ms = int(time.time() * 1000)
 
-    for addr, (state, orders, fills) in zip(addrs, results):
-        # Positions (with age derived from fills)
-        for p in state.get("assetPositions") or []:
-            pos = p.get("position") or {}
-            try:
-                size = float(pos.get("szi") or 0)
-                if size == 0:
+    for addr, (state, state_xyz, orders, fills) in zip(addrs, results):
+        # Positions from MAIN dex + xyz stock dex (label coin with `xyz:` prefix)
+        for source_state, source_label in [(state, ""), (state_xyz, "xyz:")]:
+            for p in source_state.get("assetPositions") or []:
+                pos = p.get("position") or {}
+                try:
+                    size = float(pos.get("szi") or 0)
+                    if size == 0:
+                        continue
+                    liq = pos.get("liquidationPx")
+                    raw_coin = pos.get("coin") or ""
+                    # On xyz dex the coin field already includes "xyz:" prefix
+                    # for stock perps, but defensively also prefix if missing.
+                    if source_label and not raw_coin.startswith("xyz:"):
+                        coin = source_label + raw_coin
+                    else:
+                        coin = raw_coin
+                    side = "long" if size > 0 else "short"
+                    opened_ms = _position_opened_ms(fills, raw_coin, side)
+                    age_ms = (now_ms - opened_ms) if opened_ms else None
+                    pos_rows.append({
+                        "address": addr,
+                        "coin": coin,
+                        "side": side,
+                        "size": abs(size),
+                        "entry": float(pos.get("entryPx") or 0) or None,
+                        "notional": float(pos.get("positionValue") or 0) or None,
+                        "unrealized_pnl": float(pos.get("unrealizedPnl") or 0),
+                        "leverage": (pos.get("leverage") or {}).get("value"),
+                        "liq_px": float(liq) if liq not in (None, "", "0") else None,
+                        "opened_ms": opened_ms,
+                        "age_ms": age_ms,
+                    })
+                except (TypeError, ValueError):
                     continue
-                liq = pos.get("liquidationPx")
-                coin = pos.get("coin")
-                side = "long" if size > 0 else "short"
-                opened_ms = _position_opened_ms(fills, coin, side)
-                age_ms = (now_ms - opened_ms) if opened_ms else None
-                pos_rows.append({
-                    "address": addr,
-                    "coin": coin,
-                    "side": side,
-                    "size": abs(size),
-                    "entry": float(pos.get("entryPx") or 0) or None,
-                    "notional": float(pos.get("positionValue") or 0) or None,
-                    "unrealized_pnl": float(pos.get("unrealizedPnl") or 0),
-                    "leverage": (pos.get("leverage") or {}).get("value"),
-                    "liq_px": float(liq) if liq not in (None, "", "0") else None,
-                    "opened_ms": opened_ms,
-                    "age_ms": age_ms,
-                })
-            except (TypeError, ValueError):
-                continue
         # Orders
         for o in orders:
             try:
@@ -377,6 +394,24 @@ def _render_positions(positions: pd.DataFrame, marks: Dict[str, float],
         delta=f"PnL {_fmt_usd(total_pnl)}",
     )
 
+    def _fmt_px(v):
+        """Format a price: dollar sign + thousands separators + sensible decimals.
+        $1234.56  ·  $0.000123  ·  $1,234,567.89."""
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "—"
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return "—"
+        a = abs(v)
+        if a >= 100:
+            return f"${v:,.2f}"
+        if a >= 1:
+            return f"${v:,.4f}".rstrip("0").rstrip(".")
+        if a >= 0.01:
+            return f"${v:,.6f}".rstrip("0").rstrip(".")
+        return f"${v:.8f}".rstrip("0").rstrip(".") or "$0"
+
     show = pd.DataFrame({
         "Trader": f["address"].apply(_abbrev_addr),
         "Coin": f["coin"],
@@ -384,11 +419,11 @@ def _render_positions(positions: pd.DataFrame, marks: Dict[str, float],
         "Age": f.get("age_ms", pd.Series(dtype=float)).apply(_fmt_age_ms)
                   if "age_ms" in f.columns else "—",
         "Size": f["size"].apply(lambda v: f"{v:,.4f}"),
-        "Entry $": f["entry"].apply(lambda v: f"${v:,.4g}" if pd.notna(v) else "—"),
+        "Entry $": f["entry"].apply(_fmt_px),
         "Notional": f["notional"].apply(_fmt_usd),
         "Unrl PnL": f["unrealized_pnl"].apply(_fmt_usd),
         "Lev": f["leverage"].apply(lambda v: f"{int(v)}×" if pd.notna(v) else "—"),
-        "Liq Px": f["liq_px"].apply(lambda v: f"${v:,.4g}" if pd.notna(v) else "—"),
+        "Liq Px": f["liq_px"].apply(_fmt_px),
     })
     st.dataframe(show, hide_index=True, use_container_width=True,
                   height=min(45 + 32 * len(show), 620))
