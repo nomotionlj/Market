@@ -110,21 +110,72 @@ def _account_value(row: Dict) -> float:
         return 0.0
 
 
+def _enrich_consistency(row: Dict) -> Dict:
+    """Compute consistency proxies from the 4-window perf data."""
+    perf = {w: (_pnl(row, w), _roi(row, w), _vlm(row, w))
+            for w in VALID_WINDOWS}
+    pnls = [perf[w][0] for w in VALID_WINDOWS]
+    rois = [perf[w][1] for w in VALID_WINDOWS]
+    vlms = [perf[w][2] for w in VALID_WINDOWS]
+
+    pos_windows = sum(1 for p in pnls if p > 0)
+    alltime_vlm = vlms[3]
+    alltime_pnl = pnls[3]
+
+    # Net edge in basis points per dollar traded — a real measure of skill
+    net_edge_bps = (alltime_pnl / alltime_vlm * 10_000) if alltime_vlm > 0 else 0
+
+    # Are the windows reasonably proportional, or is alltime dominated by an
+    # ancient bet? Compute "recency ratio" = month_pnl / (alltime_pnl/12) — if
+    # they're still making money at the same rate, it's near 1.0+.
+    recency = (pnls[2] * 12 / alltime_pnl) if alltime_pnl > 0 else 0
+
+    return {
+        "pos_windows": pos_windows,
+        "net_edge_bps": net_edge_bps,
+        "recency_ratio": recency,
+    }
+
+
+def _consistency_score(row: Dict) -> float:
+    """Composite 0..1 score: high = consistent winner with size.
+
+    Weights:
+      0.30 — positive windows (4/4 = full credit)
+      0.20 — net edge bps (saturates at 25bps = full credit)
+      0.20 — log-volume (size of operation)
+      0.15 — log-account-value (size of stake)
+      0.15 — recency ratio (still winning, not just past)
+    """
+    import math
+    av = _account_value(row)
+    enriched = _enrich_consistency(row)
+
+    pos = enriched["pos_windows"] / 4.0                    # 0..1
+    edge = min(max(enriched["net_edge_bps"], 0) / 25, 1)   # 0..1 at 25 bps
+    vol = math.log10(max(_vlm(row, "allTime"), 1)) / 11    # 0..1 at $100B vol
+    size = math.log10(max(av, 1)) / 10                     # 0..1 at $10B AV
+    rec = min(max(enriched["recency_ratio"], 0), 2) / 2    # 0..1 at >=2× pace
+
+    return round(0.30*pos + 0.20*edge + 0.20*vol + 0.15*size + 0.15*rec, 4)
+
+
 def top_traders(n: int = 100, sort_by: str = "account_value",
                   window: str = "allTime",
                   min_account_value: float = 0,
+                  min_pos_windows: int = 0,
+                  min_alltime_vlm: float = 0,
                   use_cache: bool = True) -> pd.DataFrame:
-    """Top-N traders sorted by:
+    """Top-N traders. Adds consistency-based sorts + filters.
 
-      - 'account_value' : current portfolio $ (default — biggest current size)
-      - 'pnl'           : PnL in the given window
-      - 'roi'           : ROI in the given window
-      - 'vlm'           : volume in the given window
+    sort_by:
+      - 'account_value', 'pnl', 'roi', 'vlm'  (the originals)
+      - 'consistency'       : composite score (positive-windows × edge × size)
+      - 'net_edge_bps'      : pure $PnL per $volume (skill, not luck)
+      - 'pos_windows'       : how many of the 4 windows are profitable
 
-    window: 'day' / 'week' / 'month' / 'allTime' (only relevant for pnl/roi/vlm)
-
-    Returns a DataFrame with: address, account_value, day_pnl, week_pnl,
-    month_pnl, alltime_pnl, day_roi_pct, week_roi_pct, ..., alltime_vlm.
+    min_pos_windows: filter out traders profitable in fewer than N windows.
+    min_alltime_vlm: hide one-off lucky bets (require real trading volume).
     """
     rows = fetch_leaderboard(use_cache=use_cache)
     if not rows:
@@ -132,6 +183,11 @@ def top_traders(n: int = 100, sort_by: str = "account_value",
 
     if min_account_value > 0:
         rows = [r for r in rows if _account_value(r) >= min_account_value]
+    if min_alltime_vlm > 0:
+        rows = [r for r in rows if _vlm(r, "allTime") >= min_alltime_vlm]
+    if min_pos_windows > 0:
+        rows = [r for r in rows
+                if _enrich_consistency(r)["pos_windows"] >= min_pos_windows]
 
     if sort_by == "account_value":
         rows = sorted(rows, key=_account_value, reverse=True)
@@ -141,6 +197,18 @@ def top_traders(n: int = 100, sort_by: str = "account_value",
         rows = sorted(rows, key=lambda r: _roi(r, window), reverse=True)
     elif sort_by == "vlm":
         rows = sorted(rows, key=lambda r: _vlm(r, window), reverse=True)
+    elif sort_by == "consistency":
+        rows = sorted(rows, key=_consistency_score, reverse=True)
+    elif sort_by == "net_edge_bps":
+        rows = sorted(rows,
+                        key=lambda r: _enrich_consistency(r)["net_edge_bps"],
+                        reverse=True)
+    elif sort_by == "pos_windows":
+        # Tie-break by all-time PnL so 4/4 winners are ordered by size
+        rows = sorted(rows,
+                        key=lambda r: (_enrich_consistency(r)["pos_windows"],
+                                         _pnl(r, "allTime")),
+                        reverse=True)
     else:
         raise ValueError(f"Unknown sort_by: {sort_by!r}")
 
@@ -148,6 +216,7 @@ def top_traders(n: int = 100, sort_by: str = "account_value",
 
     out = []
     for r in top:
+        e = _enrich_consistency(r)
         out.append({
             "address": (r.get("ethAddress") or "").lower(),
             "display_name": r.get("displayName") or "",
@@ -164,6 +233,10 @@ def top_traders(n: int = 100, sort_by: str = "account_value",
             "week_vlm": _vlm(r, "week"),
             "month_vlm": _vlm(r, "month"),
             "alltime_vlm": _vlm(r, "allTime"),
+            "pos_windows": e["pos_windows"],
+            "net_edge_bps": e["net_edge_bps"],
+            "recency_ratio": e["recency_ratio"],
+            "consistency": _consistency_score(r),
         })
     return pd.DataFrame(out)
 

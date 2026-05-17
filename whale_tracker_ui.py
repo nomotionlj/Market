@@ -26,16 +26,20 @@ import whale_bias_history as wbh
 HL_INFO = "https://api.hyperliquid.xyz/info"
 
 SORT_LABELS = {
-    "Account value (current $)": ("account_value", "allTime"),
-    "All-time PnL": ("pnl", "allTime"),
-    "Month PnL": ("pnl", "month"),
-    "Week PnL": ("pnl", "week"),
-    "Day PnL (24h)": ("pnl", "day"),
-    "All-time ROI": ("roi", "allTime"),
-    "Month ROI": ("roi", "month"),
-    "Day ROI (24h)": ("roi", "day"),
-    "All-time volume": ("vlm", "allTime"),
-    "Month volume": ("vlm", "month"),
+    "Consistency Score (recommended)":          ("consistency", "allTime"),
+    "Net edge (PnL per $ traded, bps)":         ("net_edge_bps", "allTime"),
+    "Positive windows (4/4 = ideal)":           ("pos_windows", "allTime"),
+    "──────────────────":                       ("account_value", "allTime"),
+    "Account value (current $)":                ("account_value", "allTime"),
+    "All-time PnL":                             ("pnl", "allTime"),
+    "Month PnL":                                ("pnl", "month"),
+    "Week PnL":                                 ("pnl", "week"),
+    "Day PnL (24h)":                            ("pnl", "day"),
+    "All-time ROI":                             ("roi", "allTime"),
+    "Month ROI":                                ("roi", "month"),
+    "Day ROI (24h)":                            ("roi", "day"),
+    "All-time volume":                          ("vlm", "allTime"),
+    "Month volume":                             ("vlm", "month"),
 }
 
 
@@ -45,9 +49,13 @@ SORT_LABELS = {
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _top_traders(n: int, sort_by: str, window: str,
-                   min_av: float) -> pd.DataFrame:
+                   min_av: float,
+                   min_pos_windows: int = 0,
+                   min_alltime_vlm: float = 0) -> pd.DataFrame:
     return lb.top_traders(n=n, sort_by=sort_by, window=window,
-                            min_account_value=min_av)
+                            min_account_value=min_av,
+                            min_pos_windows=min_pos_windows,
+                            min_alltime_vlm=min_alltime_vlm)
 
 
 def _post(body: Dict) -> Optional[object]:
@@ -314,16 +322,26 @@ def _render_top_traders(traders_df: pd.DataFrame, sort_label: str) -> None:
     total_alltime_pnl = df["alltime_pnl"].sum()
     total_day_pnl = df["day_pnl"].sum()
     total_month_vol = df["month_vlm"].sum()
+    avg_consistency = df["consistency"].mean() if "consistency" in df.columns else None
     a1, a2, a3, a4 = st.columns(4)
     a1.metric(f"Top {len(df)} combined AV", _fmt_usd(total_av))
     a2.metric("Combined all-time PnL", _fmt_usd(total_alltime_pnl))
-    a3.metric("Combined day PnL", _fmt_usd(total_day_pnl))
-    a4.metric("Combined month volume", _fmt_usd(total_month_vol))
+    a3.metric("Combined month vol", _fmt_usd(total_month_vol))
+    if avg_consistency is not None:
+        a4.metric("Avg consistency", f"{avg_consistency:.2f}",
+                    help="Composite 0–1. Higher = traders with positive windows, "
+                         "real volume, and sized accounts.")
 
     st.markdown(f"##### Top {len(df)} traders · sorted by **{sort_label}**")
     show = pd.DataFrame({
         "#": range(1, len(df) + 1),
         "Address": df["address"].apply(_abbrev_addr),
+        "Consistency": df.get("consistency", pd.Series(dtype=float)).apply(
+            lambda v: f"{v:.2f}" if pd.notna(v) else "—"),
+        "Pos win": df.get("pos_windows", pd.Series(dtype=int)).apply(
+            lambda v: f"{int(v)}/4" if pd.notna(v) else "—"),
+        "Edge bps": df.get("net_edge_bps", pd.Series(dtype=float)).apply(
+            lambda v: f"{v:+.1f}" if pd.notna(v) else "—"),
         "Account $": df["account_value"].apply(_fmt_usd),
         "All-time PnL": df["alltime_pnl"].apply(_fmt_usd),
         "All-time ROI": df["alltime_roi"].apply(_fmt_pct),
@@ -1058,7 +1076,9 @@ def render() -> None:
     cc1, cc2, cc3, cc4 = st.columns([2, 1, 1, 1])
     with cc1:
         sort_label = st.selectbox(
-            "Rank by", list(SORT_LABELS.keys()), index=1, key="wt_sort",
+            "Rank by", list(SORT_LABELS.keys()), index=0, key="wt_sort",
+            help="Consistency Score combines positive windows + edge bps + size. "
+                 "Pure PnL/AV rankings can be one-shot lucky bets.",
         )
         sort_by, window = SORT_LABELS[sort_label]
     with cc2:
@@ -1076,14 +1096,41 @@ def render() -> None:
         if st.button("🔄 Refresh", key="wt_refresh"):
             _top_traders.clear()
             _clearinghouse.clear()
+            _clearinghouse_xyz.clear()
             _frontend_open_orders.clear()
             _whale_dataset.clear()
             _live_marks.clear()
             st.rerun()
 
+    # ── Consistency filters ──
+    fc1, fc2, fc3 = st.columns([1, 1, 4])
+    with fc1:
+        min_pos_windows = st.select_slider(
+            "Positive windows ≥",
+            options=[0, 1, 2, 3, 4], value=2,
+            key="wt_min_posw",
+            help="Filter traders profitable in at least this many of the "
+                 "4 time windows (day/week/month/allTime). 3+ = real winners.",
+        )
+    with fc2:
+        min_vlm_m = st.number_input(
+            "Min all-time volume ($M)", 0.0, 100000.0, 1.0, step=1.0,
+            key="wt_min_vlm",
+            help="Hide one-shot lucky bets. $1M+ volume = they've actually traded.",
+        )
+    with fc3:
+        st.caption(
+            "**How to use**: sort by **Consistency Score** + filter "
+            "**positive windows ≥ 3** + min volume to exclude one-bet wonders. "
+            "Sort by **Net edge bps** to find the highest skill (PnL per dollar traded). "
+        )
+
     with st.spinner("Fetching HL leaderboard..."):
         try:
-            traders_df = _top_traders(top_n, sort_by, window, min_av_m * 1e6)
+            traders_df = _top_traders(top_n, sort_by, window,
+                                          min_av_m * 1e6,
+                                          min_pos_windows=int(min_pos_windows),
+                                          min_alltime_vlm=min_vlm_m * 1e6)
         except Exception as e:
             st.error(f"Leaderboard fetch failed: {e}")
             return
