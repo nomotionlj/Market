@@ -34,6 +34,20 @@ The app opens at http://localhost:8501
 - **Forward accuracy** = % of signal events where the next N-bar return matched signal direction. **Win rate** = % of round-trip trades that were profitable. They measure different things — both are shown.
 - **Dark pool data**: not included. Real dark pool prints require a paid feed (Cheddar Flow, BlackBoxStocks, Unusual Whales). FINRA publishes weekly ATS volume free but with significant delay; can be added on request.
 
+## Dune Analytics MCP (Claude Code)
+
+This repo ships a project-scoped `.mcp.json` that registers the Dune Analytics
+HTTP MCP server for Claude Code sessions. The API key is read from the
+`DUNE_API_KEY` environment variable — it is **not** committed.
+
+To enable it, export your key before launching Claude Code:
+
+```bash
+export DUNE_API_KEY="your-dune-api-key"   # https://dune.com/settings/api
+```
+
+Claude Code expands `${DUNE_API_KEY}` into the `x-dune-api-key` request header.
+
 ## Adding a fund to the famous list
 
 Edit `holdings.py` → `FAMOUS_FUNDS`. Find a CIK by searching at https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany.
